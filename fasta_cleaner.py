@@ -7,7 +7,9 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Align import MultipleSeqAlignment
 from Bio import AlignIO
 from Bio.Align import AlignInfo
-import tempfile
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+import time
 
 def parse_arguments():
     """Set up command line argument parsing with clear help text and validation."""
@@ -42,6 +44,13 @@ def parse_arguments():
         help='Consensus threshold (0.0-1.0). Minimum frequency required for a base to be included in consensus'
     )
     
+    parser.add_argument(
+        '-T', '--threads',
+        type=int,
+        default=multiprocessing.cpu_count(),
+        help='Number of parallel threads to use'
+    )
+    
     args = parser.parse_args()
     
     if not os.path.isdir(args.input_dir):
@@ -49,6 +58,9 @@ def parse_arguments():
     
     if not 0 <= args.threshold <= 1:
         parser.error("Threshold must be between 0.0 and 1.0")
+        
+    if args.threads < 1:
+        parser.error("Number of threads must be at least 1")
     
     return args
 
@@ -98,9 +110,24 @@ def get_base_filename(filepath):
             return basename[:-len(ext)]
     return basename
 
-def process_fasta_file(input_file, at_threshold=0.5, consensus_threshold=0.7):
-    """Process a single FASTA file and return alignments and metrics."""
-    alignment = AlignIO.read(input_file, "fasta")
+def process_single_file(input_file, output_dir, at_threshold, consensus_threshold):
+    """Process a single FASTA file with the given parameters."""
+    base_name = get_base_filename(os.path.basename(input_file))
+    
+    # First check if file is empty
+    if os.path.getsize(input_file) == 0:
+        print(f"Warning: {input_file} is empty. Skipping...")
+        return {"status": "empty", "filename": input_file}
+        
+    try:
+        alignment = AlignIO.read(input_file, "fasta")
+    except ValueError as e:
+        print(f"Warning: Could not read {input_file}: {str(e)}")
+        print("File may be corrupted or malformed. Skipping...")
+        return {"status": "corrupted", "filename": input_file}
+    except Exception as e:
+        print(f"Error processing {input_file}: {str(e)}")
+        return {"status": "error", "filename": input_file}
     
     kept_records = []
     removed_records = []
@@ -121,11 +148,29 @@ def process_fasta_file(input_file, at_threshold=0.5, consensus_threshold=0.7):
         summary_align = AlignInfo.SummaryInfo(kept_alignment)
         consensus = summary_align.dumb_consensus(threshold=consensus_threshold)
         
-        base_name = get_base_filename(os.path.basename(input_file))
-        consensus_id = f"{base_name}_t{at_threshold}_c{consensus_threshold}"
+        # Convert consensus string to list for manipulation
+        consensus_seq = list(str(consensus))
         
+        # Get alignment length
+        align_len = kept_alignment.get_alignment_length()
+        
+        # For each position in the alignment
+        for i in range(align_len):
+            # Get all bases at this position (excluding gaps)
+            bases = [record.seq[i] for record in kept_records if record.seq[i] != '-']
+            
+            if consensus_seq[i] == 'X':
+                if len(bases) == 0:  # No bases at this position (all gaps)
+                    consensus_seq[i] = '-'
+                else:  # Has bases but doesn't meet threshold
+                    consensus_seq[i] = 'N'
+        
+        # Convert back to string
+        consensus_seq = ''.join(consensus_seq)
+        
+        consensus_id = f"{base_name}_t{at_threshold}_c{consensus_threshold}"
         consensus_record = SeqRecord(
-            Seq(str(consensus)),
+            Seq(consensus_seq),
             id=consensus_id,
             description=""
         )
@@ -133,58 +178,145 @@ def process_fasta_file(input_file, at_threshold=0.5, consensus_threshold=0.7):
     if removed_records:
         removed_alignment = MultipleSeqAlignment(removed_records)
     
-    return kept_alignment, removed_alignment, consensus_record, alignment
+    # Write output files
+    cleaned_path = os.path.join(output_dir, f"{base_name}_cleaned.fasta")
+    removed_path = os.path.join(output_dir, f"{base_name}_removed.fasta")
+    consensus_path = os.path.join(output_dir, "cleaned_consensus", f"{base_name}_cleaned_consensus.fasta")
+    report_path = os.path.join(output_dir, f"{base_name}_report.csv")
+    
+    if kept_alignment:
+        write_fasta_single_line(kept_alignment, cleaned_path)
+    if removed_alignment:
+        write_fasta_single_line(removed_alignment, removed_path)
+    if consensus_record:
+        write_fasta_single_line([consensus_record], consensus_path)
+    
+    write_sequence_report(alignment, at_threshold, report_path)
+    
+    result = {
+        "status": "success",
+        "filename": input_file,
+        "original_count": len(alignment),
+        "kept_count": len(kept_alignment) if kept_alignment else 0,
+        "removed_count": len(removed_alignment) if removed_alignment else 0,
+        "paths": {
+            "cleaned": cleaned_path,
+            "removed": removed_path,
+            "consensus": consensus_path,
+            "report": report_path
+        }
+    }
+    
+    return result
 
-def process_directory(input_dir, output_dir, at_threshold=0.5, consensus_threshold=0.7):
-    """Process all FASTA files in a directory."""
+def process_directory(input_dir, output_dir, at_threshold=0.5, consensus_threshold=0.7, num_threads=None):
+    """Process all FASTA files in a directory using parallel processing."""
     os.makedirs(output_dir, exist_ok=True)
+    # Create consensus subdirectory
+    consensus_dir = os.path.join(output_dir, "cleaned_consensus")
+    os.makedirs(consensus_dir, exist_ok=True)
     
-    processed_count = 0
+    # Create a log file for skipped files
+    log_file = os.path.join(output_dir, "processing_log.txt")
+    with open(log_file, 'w') as f:
+        f.write("FASTA Processing Log\n")
+        f.write("==================\n\n")
     
-    for filename in os.listdir(input_dir):
-        if filename.lower().endswith(('.fasta', '.fas', '.fa')):
-            input_path = os.path.join(input_dir, filename)
-            base_name = get_base_filename(filename)
-            
-            kept_alignment, removed_alignment, consensus, all_sequences = process_fasta_file(
-                input_path, at_threshold, consensus_threshold
-            )
-            
-            cleaned_path = os.path.join(output_dir, f"{base_name}_cleaned.fasta")
-            removed_path = os.path.join(output_dir, f"{base_name}_removed.fasta")
-            consensus_path = os.path.join(output_dir, f"{base_name}_cleaned_consensus.fasta")
-            report_path = os.path.join(output_dir, f"{base_name}_report.csv")
-            
-            original_count = len(all_sequences)
-            kept_count = len(kept_alignment) if kept_alignment else 0
-            removed_count = len(removed_alignment) if removed_alignment else 0
-            
-            if kept_alignment:
-                write_fasta_single_line(kept_alignment, cleaned_path)
-            if removed_alignment:
-                write_fasta_single_line(removed_alignment, removed_path)
-            if consensus:
-                write_fasta_single_line([consensus], consensus_path)
-            
-            write_sequence_report(all_sequences, at_threshold, report_path)
-            
-            print(f"Processed {filename}:")
-            print(f"  - Original sequences: {original_count}")
-            print(f"  - Kept sequences: {kept_count}")
-            print(f"  - Removed sequences: {removed_count}")
-            print(f"  - Saved cleaned alignment to: {cleaned_path}")
-            print(f"  - Saved removed sequences to: {removed_path}")
-            print(f"  - Saved consensus to: {consensus_path}")
-            print(f"  - Saved sequence report to: {report_path}")
-            print()
-            
-            processed_count += 1
+    # Get list of FASTA files
+    fasta_files = [
+        os.path.join(input_dir, f) for f in os.listdir(input_dir)
+        if f.lower().endswith(('.fasta', '.fas', '.fa'))
+    ]
     
-    if processed_count == 0:
+    if not fasta_files:
         print(f"No FASTA files found in {input_dir}")
-    else:
-        print(f"Finished processing {processed_count} FASTA files")
+        return
+    
+    start_time = time.time()
+    
+    # Process files in parallel
+    with ProcessPoolExecutor(max_workers=num_threads) as executor:
+        # Create a list of futures
+        futures = [
+            executor.submit(process_single_file, f, output_dir, at_threshold, consensus_threshold)
+            for f in fasta_files
+        ]
+        
+        # Process results as they complete
+        results = []
+        for future in futures:
+            result = future.result()
+            results.append(result)
+            
+            # Print progress for successful processing
+            if result['status'] == 'success':
+                print(f"Processed {os.path.basename(result['filename'])}:")
+                print(f"  - Original sequences: {result['original_count']}")
+                print(f"  - Kept sequences: {result['kept_count']}")
+                print(f"  - Removed sequences: {result['removed_count']}")
+                print(f"  - Saved cleaned alignment to: {result['paths']['cleaned']}")
+                print(f"  - Saved removed sequences to: {result['paths']['removed']}")
+                print(f"  - Saved consensus to: {result['paths']['consensus']}")
+                print(f"  - Saved sequence report to: {result['paths']['report']}")
+                print()
+    
+    # Compile statistics
+    processed_count = sum(1 for r in results if r['status'] == 'success')
+    empty_count = sum(1 for r in results if r['status'] == 'empty')
+    corrupted_count = sum(1 for r in results if r['status'] == 'corrupted')
+    error_count = sum(1 for r in results if r['status'] == 'error')
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    # Write final summary
+    summary = f"""
+Processing Summary:
+==================
+Total files processed successfully: {processed_count}
+Empty files skipped: {empty_count}
+Corrupted files skipped: {corrupted_count}
+Files with processing errors: {error_count}
+Total processing time: {total_time:.2f} seconds
+Average time per file: {total_time/len(fasta_files):.2f} seconds
+
+Detailed log written to: {log_file}
+"""
+    print(summary)
+    
+    # Write summary to log file
+    with open(log_file, 'a') as f:
+        f.write(summary)
+        
+        # Write detailed results for each file
+        f.write("\nDetailed Results:\n")
+        f.write("================\n")
+        for result in results:
+            f.write(f"\nFile: {os.path.basename(result['filename'])}\n")
+            f.write(f"Status: {result['status']}\n")
+            if result['status'] == 'success':
+                f.write(f"Original sequences: {result['original_count']}\n")
+                f.write(f"Kept sequences: {result['kept_count']}\n")
+                f.write(f"Removed sequences: {result['removed_count']}\n")
+    
+    # Concatenate all consensus files from the cleaned_consensus subdirectory
+    consensus_dir = os.path.join(output_dir, "cleaned_consensus")
+    concat_consensus_path = os.path.join(output_dir, "concat_cleaned_consensus.fasta")
+    
+    with open(concat_consensus_path, 'w') as outfile:
+        for consensus_file in sorted(os.listdir(consensus_dir)):
+            if consensus_file.endswith('.fasta'):
+                with open(os.path.join(consensus_dir, consensus_file)) as infile:
+                    outfile.write(infile.read())
+    
+    print(f"\nConcatenated consensus sequences saved to: {concat_consensus_path}")
 
 if __name__ == "__main__":
     args = parse_arguments()
-    process_directory(args.input_dir, args.output_dir, args.threshold, args.consensus_threshold)
+    process_directory(
+        args.input_dir,
+        args.output_dir,
+        args.threshold,
+        args.consensus_threshold,
+        args.threads
+    )
