@@ -1,6 +1,6 @@
-# FASTA Sequence Cleaner
+# FASTA Cleaner with Human detection and sliding AT ratios 
 
-This Python script processes FASTA sequence alignments to identify and remove potentially contaminated or divergent sequences. It uses two main filtering criteria: similarity to human COX1 sequences (to remove human contamination) and deviation from the consensus AT content (to remove sequences with unusual base composition).
+This Python script processes FASTA sequence alignments to identify and remove potentially contaminated or divergent sequences. It uses two main filtering criteria: similarity to human COX1 sequences (to remove human contamination) and deviation from the consensus AT content to remove sequences with unusual base composition (e.g. Fungi).
 
 ## Features
 
