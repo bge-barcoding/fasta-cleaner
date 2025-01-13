@@ -1,4 +1,4 @@
-# FASTA Cleaner
+# FASTA Cleaner with fixed AT ratios
 
 ## Overview
 
