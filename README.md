@@ -69,7 +69,7 @@ python fasta_cleaner_combined.py \
     --human_threshold 0.95 \
     --at_difference 0.1 \
     --percentile_threshold 90.0 \
-    --consensus_threshold 0.7
+    --consensus_threshold 0.5
 ```
 
 ### Command Line Arguments
@@ -82,7 +82,7 @@ python fasta_cleaner_combined.py \
 | `-u`, `--human_threshold` | Human COX1 similarity threshold (0-1) | 0.95 |
 | `-d`, `--at_difference` | Maximum allowed AT content difference | 0.1 |
 | `-p`, `--percentile_threshold` | Percentile for outlier detection (0-100) | 90.0 |
-| `-c`, `--consensus_threshold` | Consensus sequence generation threshold | 0.7 |
+| `-c`, `--consensus_threshold` | Consensus sequence generation threshold | 0.5 |
 
 ### Filter Control Flags
 
