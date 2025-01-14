@@ -145,7 +145,7 @@ If you use this tool in your research, please cite:
 
 ```bibtex
 @software{fasta_sequence_cleaner,
-  author = {Ben Price AND Daniel Parsons AND Jordan Beasley},
+  author = {Ben Price AND Daniel Parsons AND Jordan Beasley AND Claude Sonnet},
   title = {FASTA Sequence Cleaner},
   year = {2024},
   url = {https://github.com/bge-barcoding/fasta-cleaner}
