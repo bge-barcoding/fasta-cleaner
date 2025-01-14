@@ -144,9 +144,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 If you use this tool in your research, please cite:
 
 ```bibtex
-@software{fasta_sequence_cleaner,
+@software{fasta_cleaner,
   author = {Ben Price AND Daniel Parsons AND Jordan Beasley AND Claude Sonnet},
-  title = {FASTA Sequence Cleaner},
+  title = {FASTA Cleaner},
   year = {2024},
   url = {https://github.com/bge-barcoding/fasta-cleaner}
 }
