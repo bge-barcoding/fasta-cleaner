@@ -130,7 +130,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-c', '--consensus_threshold',
         type=float,
-        default=0.7,
+        default=0.5,
         help='Threshold for consensus sequence generation (0.0-1.0)'
     )
     
