@@ -118,6 +118,17 @@ def parse_arguments() -> argparse.Namespace:
         help='Maximum allowed AT content difference from consensus (0.0-1.0)'
     )
     
+    parser.add_argument(
+        '-m','--at_mode',
+        type=str,
+        choices=['absolute', 'higher', 'lower'],
+        default='absolute',
+        help='AT content filtering mode: "absolute" removes sequences if AT content differs '
+             'from consensus by more than threshold in either direction, "higher" removes only '
+             'sequences with AT content above consensus + threshold, "lower" removes only '
+             'sequences with AT content below consensus - threshold'
+    )
+    
     # Statistical outlier detection parameters
     parser.add_argument(
         '-p', '--percentile_threshold',
@@ -170,6 +181,100 @@ def parse_arguments() -> argparse.Namespace:
 # Custom type definitions for improved code clarity
 SequenceRecord = SeqRecord
 SequenceAlignment = MultipleSeqAlignment
+
+def get_sequence_start_position(sequence: str) -> int:
+    """
+    Find the position of the first non-gap character in a sequence.
+    
+    Args:
+        sequence: Aligned sequence string potentially containing gaps
+        
+    Returns:
+        int: Position of first non-gap character (0-based) or length of sequence if all gaps
+    """
+    for i, char in enumerate(sequence):
+        if char != '-':
+            return i
+    return len(sequence)
+
+def sort_sequences_by_position(records: List[SeqRecord]) -> List[SeqRecord]:
+    """
+    Sort sequence records by their starting position in the alignment.
+    
+    Args:
+        records: List of SeqRecord objects to sort
+        
+    Returns:
+        List[SeqRecord]: Sorted list of records
+    """
+    # Create tuples of (start_position, original_index, record) to maintain stable sort
+    indexed_records = [
+        (get_sequence_start_position(str(record.seq)), i, record)
+        for i, record in enumerate(records)
+    ]
+    
+    # Sort by start position, using original index as tiebreaker
+    sorted_records = [
+        record for _, _, record in sorted(indexed_records)
+    ]
+    
+    return sorted_records
+
+def create_annotated_sequence_record(record: SeqRecord, fate: str) -> SeqRecord:
+    """
+    Create a new sequence record with the fate prefix added to its ID.
+    
+    Args:
+        record: Original SeqRecord object
+        fate: String indicating the sequence's fate (e.g., 'kept', 'removed_human')
+        
+    Returns:
+        SeqRecord: New record with modified ID
+    """
+    # Create a deep copy to avoid modifying the original
+    new_record = SeqRecord(
+        seq=record.seq,
+        id=f"{fate}_{record.id}",
+        name=record.name,
+        description=record.description
+    )
+    return new_record
+
+def write_ordered_annotated_alignment(
+    kept_records: List[SeqRecord],
+    removed_records: Dict[str, List[SeqRecord]],
+    output_path: str
+) -> None:
+    """
+    Write all sequences to a FASTA file with fate annotations and ordered by start position.
+    
+    Args:
+        kept_records: List of sequences that passed all filters
+        removed_records: Dictionary mapping removal reasons to lists of removed sequences
+        output_path: Path to write the output file
+    """
+    # Create annotated records for all sequences
+    all_records = []
+    
+    # Add kept sequences with 'kept' prefix
+    all_records.extend(
+        create_annotated_sequence_record(record, 'kept')
+        for record in kept_records
+    )
+    
+    # Add removed sequences with appropriate prefixes
+    for reason, records in removed_records.items():
+        prefix = f"removed_{reason}"
+        all_records.extend(
+            create_annotated_sequence_record(record, prefix)
+            for record in records
+        )
+    
+    # Sort all records by start position
+    sorted_records = sort_sequences_by_position(all_records)
+    
+    # Write to file
+    write_sequences_to_fasta(sorted_records, output_path)
 
 def find_best_alignment(query: str, reference: str, min_overlap: int = 20) -> tuple[int, int, int]:
     """
@@ -469,7 +574,7 @@ class FilterResult(NamedTuple):
     reference_metrics: Optional[Dict[str, float]] = None  # Optional reference-based metrics
 
 def generate_consensus_sequence(alignment: MultipleSeqAlignment, 
-                              threshold: float = 0.7) -> Tuple[str, List[Dict[str, float]]]:
+                              threshold: float = 0.5) -> Tuple[str, List[Dict[str, float]]]:
     """
     Generate consensus sequence and calculate position-specific frequencies.
     
@@ -534,7 +639,8 @@ def filter_human_sequences(records: List[SeqRecord],
 
 def filter_at_content(records: List[SeqRecord],
                      consensus_seq: str,
-                     threshold: float = 0.1) -> Tuple[List[SeqRecord], List[SeqRecord]]:
+                     threshold: float = 0.1,
+                     mode: str = 'absolute') -> Tuple[List[SeqRecord], List[SeqRecord]]:
     """
     Filter sequences based on AT content difference from consensus.
     
@@ -542,6 +648,10 @@ def filter_at_content(records: List[SeqRecord],
         records: List of SeqRecord objects
         consensus_seq: Consensus sequence string
         threshold: Maximum allowed AT content difference
+        mode: Filtering mode ('absolute', 'higher', or 'lower')
+            - 'absolute': Remove if AT content differs from consensus by more than threshold
+            - 'higher': Remove if AT content exceeds consensus by more than threshold
+            - 'lower': Remove if AT content is below consensus by more than threshold
     
     Returns:
         Tuple containing:
@@ -552,8 +662,19 @@ def filter_at_content(records: List[SeqRecord],
     removed = []
     
     for record in records:
-        _, _, at_diff = compare_at_content(consensus_seq, str(record.seq))
-        if at_diff > threshold:
+        query_at, cons_at, at_diff = compare_at_content(consensus_seq, str(record.seq))
+        # Calculate signed difference (positive means query has higher AT content)
+        signed_diff = query_at - cons_at
+        
+        should_remove = False
+        if mode == 'absolute':
+            should_remove = abs(signed_diff) > threshold
+        elif mode == 'higher':
+            should_remove = signed_diff > threshold
+        elif mode == 'lower':
+            should_remove = signed_diff < -threshold
+        
+        if should_remove:
             removed.append(record)
         else:
             kept.append(record)
@@ -715,9 +836,10 @@ def filter_reference_outliers(records: List[SeqRecord],
     return kept, removed, aggregate_metrics
 
 def apply_filters(alignment: MultipleSeqAlignment,
-                 consensus_threshold: float = 0.7,
+                 consensus_threshold: float = 0.5,
                  human_threshold: float = 0.95,
                  at_threshold: float = 0.1,
+                 at_mode: str = 'absolute',
                  outlier_percentile: float = 90.0,
                  reference_seq: Optional[str] = None,
                  enable_human: bool = True,
@@ -743,6 +865,7 @@ def apply_filters(alignment: MultipleSeqAlignment,
         consensus_threshold: Threshold for consensus generation (0-1)
         human_threshold: Human similarity threshold for removal (0-1)
         at_threshold: Maximum allowed AT content difference (0-1)
+        at_mode: AT content filtering mode ('absolute', 'higher', or 'lower')
         outlier_percentile: Percentile threshold for outlier detection (0-100)
         reference_seq: Optional reference sequence string
         enable_human: Enable human similarity filtering
@@ -777,14 +900,14 @@ def apply_filters(alignment: MultipleSeqAlignment,
         consensus, freqs = generate_consensus_sequence(temp_alignment, consensus_threshold)
         return str(consensus), freqs
     
-    # Initialize consensus and frequencies
-    consensus_seq, frequencies = update_consensus(current_records)
-    
+    # Initialize consensus and frequencies - used only for initial metrics
+    initial_consensus_seq, initial_frequencies = update_consensus(current_records)
+
     # Calculate initial metrics for all sequences
     for record in current_records:
         metrics[record.id] = analyze_sequence_metrics(
-            record, consensus_seq, frequencies
-        )
+            record, initial_consensus_seq, initial_frequencies
+    )
     
     # 1. Human COX1 similarity filtering
     if enable_human and current_records:
@@ -792,17 +915,22 @@ def apply_filters(alignment: MultipleSeqAlignment,
         removed_records['human_similar'].extend(removed)
         current_records = kept
         
-        if removed:  # Only recalculate if sequences were removed
-            consensus_seq, frequencies = update_consensus(current_records)
-            # Update metrics for remaining sequences
-            for record in current_records:
-                metrics[record.id].update(
-                    analyze_sequence_metrics(record, consensus_seq, frequencies)
-                )
+        # Always recalculate consensus after human filtering, before AT content comparison
+        consensus_seq, frequencies = update_consensus(current_records)
+        # Update metrics for remaining sequences
+        for record in current_records:
+            metrics[record.id].update(
+                analyze_sequence_metrics(record, consensus_seq, frequencies)
+            )
     
-    # 2. AT content filtering
+    # 2. AT content filtering with mode support
     if enable_at and current_records:
-        kept, removed = filter_at_content(current_records, consensus_seq, at_threshold)
+        kept, removed = filter_at_content(
+            current_records,
+            consensus_seq,
+            threshold=at_threshold,
+            mode=at_mode
+        )
         removed_records['at_difference'].extend(removed)
         current_records = kept
         
@@ -960,9 +1088,10 @@ def write_metrics_report(filter_result: FilterResult, output_path: str) -> None:
 def process_fasta_file(input_file: str, 
                       output_dir: str,
                       reference_file: Optional[str] = None,
-                      consensus_threshold: float = 0.7,
+                      consensus_threshold: float = 0.5,
                       human_threshold: float = 0.95,
                       at_threshold: float = 0.1,
+                      at_mode: str = 'absolute',
                       outlier_percentile: float = 90.0,
                       enable_human: bool = True,
                       enable_at: bool = True,
@@ -978,6 +1107,7 @@ def process_fasta_file(input_file: str,
         consensus_threshold: Threshold for consensus generation
         human_threshold: Human similarity threshold
         at_threshold: AT content difference threshold
+        at_mode: AT content filtering mode ('absolute', 'higher', or 'lower')
         outlier_percentile: Percentile for outlier detection
         enable_human: Enable human similarity filtering
         enable_at: Enable AT content filtering
@@ -994,7 +1124,8 @@ def process_fasta_file(input_file: str,
         'removed': os.path.join(output_dir, f"{base_name}_removed_all.fasta"),
         'consensus': os.path.join(output_dir, f"{base_name}_consensus.fasta"),
         'metrics': os.path.join(output_dir, f"{base_name}_metrics.csv"),
-        'log': os.path.join(output_dir, f"{base_name}_log.txt")
+        'log': os.path.join(output_dir, f"{base_name}_log.txt"),
+        'ordered_annotated': os.path.join(output_dir, f"{base_name}_ordered_annotated.fasta")
     }
     
     # Create category-specific files for removed sequences
@@ -1025,6 +1156,7 @@ def process_fasta_file(input_file: str,
             log_file.write(f"- Consensus threshold: {consensus_threshold}\n")
             log_file.write(f"- Human threshold: {human_threshold}\n")
             log_file.write(f"- AT threshold: {at_threshold}\n")
+            log_file.write(f"- AT mode: {at_mode}\n")
             log_file.write(f"- Outlier percentile: {outlier_percentile}\n")
             log_file.write("Enabled filters:\n")
             log_file.write(f"- Human similarity: {'Yes' if enable_human else 'No'}\n")
@@ -1053,6 +1185,7 @@ def process_fasta_file(input_file: str,
                 consensus_threshold=consensus_threshold,
                 human_threshold=human_threshold,
                 at_threshold=at_threshold,
+                at_mode=at_mode,
                 outlier_percentile=outlier_percentile,
                 reference_seq=reference_seq,
                 enable_human=enable_human,
@@ -1065,9 +1198,11 @@ def process_fasta_file(input_file: str,
             
             # Write outputs
             if filter_result.kept_records:
-                write_sequences_to_fasta(filter_result.kept_records, output_paths['cleaned'])
-                log_file.write(f"Wrote {len(filter_result.kept_records)} kept sequences to: {output_paths['cleaned']}\n")
-                
+                # Sort kept sequences by start position before writing
+                sorted_kept_records = sort_sequences_by_position(filter_result.kept_records)
+                write_sequences_to_fasta(sorted_kept_records, output_paths['cleaned'])
+                log_file.write(f"Wrote {len(sorted_kept_records)} kept sequences to: {output_paths['cleaned']}\n")
+               
                 # Write consensus sequence
                 consensus_record = SeqRecord(
                     Seq(filter_result.consensus_seq),
@@ -1090,6 +1225,14 @@ def process_fasta_file(input_file: str,
             if all_removed:
                 write_sequences_to_fasta(all_removed, output_paths['removed'])
                 log_file.write(f"Wrote {len(all_removed)} total removed sequences to: {output_paths['removed']}\n")
+            
+             # Write new ordered and annotated alignment file
+            write_ordered_annotated_alignment(
+                filter_result.kept_records,
+                filter_result.removed_records,
+                output_paths['ordered_annotated']
+            )
+            log_file.write(f"Wrote ordered and annotated alignment to: {output_paths['ordered_annotated']}\n")
             
             # Write metrics report
             write_metrics_report(filter_result, output_paths['metrics'])
@@ -1154,6 +1297,7 @@ def process_directory(args: argparse.Namespace) -> None:
                     consensus_threshold=args.consensus_threshold,
                     human_threshold=args.human_threshold,
                     at_threshold=args.at_difference,
+                    at_mode=args.at_mode,
                     outlier_percentile=args.percentile_threshold,
                     enable_human=not args.disable_human,
                     enable_at=not args.disable_at,
