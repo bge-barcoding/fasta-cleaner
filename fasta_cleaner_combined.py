@@ -15,23 +15,109 @@ from collections import Counter
 from collections import defaultdict
 import traceback
 
-"""
-FASTA Sequence Cleaner and Analysis Tool
+"""FASTA Sequence Cleaner and Analysis Tool
 
-This module combines multiple sequence filtering approaches:
+A comprehensive tool for cleaning and analysing FASTA sequence alignments using multiple filtering approaches:
 - Human COX1 similarity detection
-- AT content analysis
+- AT-content analysis
 - Statistical outlier detection
 - Reference sequence comparison
 
-The filtering pipeline processes sequences in a specific order:
+The tool processes each alignment file through a sequential filtering pipeline:
 1. Remove sequences with high human COX1 similarity
 2. Filter sequences with divergent AT content
 3. Remove statistical outliers
 4. Compare against reference sequences (if provided)
 
+Input:
+------
+Required:
+    - Directory containing FASTA alignment files (.fasta, .fas, or .fa)
+    - Output directory for results
+
+Optional:
+    - Directory containing reference sequences (named as original_filename_reference.fasta)
+
+Output:
+-------
+For each input file, generates:
+    - {basename}_cleaned.fasta: Filtered sequences that passed all criteria
+    - {basename}_consensus.fasta: Consensus sequence generated from cleaned alignment
+    - {basename}_metrics.csv: Detailed metrics for all sequences
+    - {basename}_ordered_annotated.fasta: All sequences with filtering annotations
+    - {basename}_removed_all.fasta: All removed sequences combined
+    - {basename}_removed_human.fasta: Sequences removed due to human similarity
+    - {basename}_removed_at.fasta: Sequences removed due to AT content
+    - {basename}_removed_outlier.fasta: Sequences removed as statistical outliers
+    - {basename}_removed_reference.fasta: Sequences removed based on reference comparison
+    - {basename}_log.txt: Detailed processing log
+
+Options:
+--------
+Filter Enablement:
+    --disable_human: Skip human COX1 similarity filtering
+    --disable_at: Skip AT content filtering
+    --disable_outliers: Skip statistical outlier detection
+
+Human COX1 Filtering:
+    -u, --human_threshold: Similarity threshold (0.0-1.0, default: 0.95)
+        Sequences with similarity >= threshold are removed
+
+AT Content Filtering:
+    -d, --at_difference: Maximum allowed AT content difference (0.0-1.0, default: 0.1)
+    -m, --at_mode: Filtering mode (default: 'absolute')
+        - 'absolute': Remove if AT content differs from consensus by more than threshold
+        - 'higher': Remove only sequences with AT content above consensus + threshold
+        - 'lower': Remove only sequences with AT content below consensus - threshold
+
+Statistical Outlier Detection:
+    -p, --percentile_threshold: Percentile for outlier detection (0.0-100.0, default: 90.0)
+        Sequences with deviation scores above this percentile are removed
+
+Consensus Generation:
+    -c, --consensus_threshold: Threshold for consensus sequence generation (0.0-1.0, default: 0.5)
+        Minimum frequency required to call a consensus base
+
+Reference Sequence Comparison:
+    -r, --reference_dir: Directory containing reference sequences
+        Reference files should be named as {original_filename}_reference.fasta
+
 Usage:
-    python fasta_cleaner_combined.py -i input_dir -o output_dir [options]
+------
+Basic usage:
+    python fasta_cleaner_combined.py -i input_dir -o output_dir
+
+With all options:
+    python fasta_cleaner_combined.py -i input_dir -o output_dir \\
+        -r reference_dir \\
+        -u 0.95 \\
+        -d 0.1 \\
+        -m absolute \\
+        -p 90.0 \\
+        -c 0.5
+
+Disable specific filters:
+    python fasta_cleaner_combined.py -i input_dir -o output_dir \\
+        --disable_human --disable_at
+
+Requirements:
+------------
+Python packages:
+    - BioPython
+    - NumPy
+    - typing
+    - argparse
+
+Example:
+--------
+python fasta_cleaner_combined.py \\
+    -i /path/to/fasta/files \\
+    -o /path/to/output \\
+    -r /path/to/references \\
+    -u 0.98 \\
+    -d 0.15 \\
+    -m absolute \\
+    -p 95.0
 """
 
 # Reference human COX1 sequence
