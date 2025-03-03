@@ -154,11 +154,20 @@ SequenceAlignment = MultipleSeqAlignment
 # Utility Functions
 # =============================================================================
 def get_base_filename(filepath: str) -> str:
-    """Extract base filename without extension."""
+    """
+    Extract base filename without extension and without '_align' substring.
+    """
     basename = os.path.basename(filepath)
+    # First remove the file extension
     for ext in ['.fasta', '.fas', '.fa']:
         if basename.lower().endswith(ext):
-            return basename[:-len(ext)]
+            basename = basename[:-len(ext)]
+            break
+    
+    # Then remove '_align' if present
+    if '_align' in basename:
+        basename = basename.replace('_align', '')
+    
     return basename
 
 def get_default_threads() -> int:
@@ -396,8 +405,11 @@ def calculate_unweighted_deviation(sequence: str, reference: str) -> float:
 
 def analyse_sequence_metrics(record: SeqRecord, 
                            consensus_seq: Optional[str] = None,
-                           frequencies: Optional[List[Dict[str, float]]] = None) -> Dict[str, float]:
-    """Calculate comprehensive sequence metrics."""
+                           frequencies: Optional[List[Dict[str, float]]] = None,
+                           alignment_length: Optional[int] = None) -> Dict[str, float]:
+    """
+    Calculate comprehensive sequence metrics.
+    """
     sequence = str(record.seq).upper()
     sequence_no_gaps = sequence.replace('-', '')
     
@@ -406,6 +418,11 @@ def analyse_sequence_metrics(record: SeqRecord,
         'at_content': calculate_at_content(sequence_no_gaps),
         'human_similarity': calculate_sequence_similarity(sequence, HUMAN_COX1)
     }
+    
+    # Add coverage metrics if alignment length is provided
+    if alignment_length is not None:
+        coverage_metrics = calculate_sequence_coverage(record, alignment_length)
+        metrics.update(coverage_metrics)
     
     if consensus_seq is not None:
         # Calculate AT content comparison
@@ -453,7 +470,75 @@ def generate_consensus_sequence(alignment: MultipleSeqAlignment,
     
     return ''.join(consensus), frequencies
 
+def calculate_coverage_depth(alignment: MultipleSeqAlignment) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Calculate coverage depth at each position of the alignment.
+    """
+    if not alignment:
+        return np.array([]), {
+            'coverage_percent': 0.0,
+            'min_coverage': 0.0,
+            'max_coverage': 0.0,
+            'avg_coverage': 0.0,
+            'median_coverage': 0.0
+        }
+    
+    # Get alignment length
+    align_length = alignment.get_alignment_length()
+    
+    # Initialize depth array
+    depth_array = np.zeros(align_length, dtype=int)
+    
+    # Count non-gap characters at each position
+    for record in alignment:
+        seq_str = str(record.seq).upper()
+        for i, char in enumerate(seq_str):
+            if char != '-':
+                depth_array[i] += 1
+    
+    # Calculate coverage statistics
+    covered_positions = np.count_nonzero(depth_array)
+    coverage_percent = (covered_positions / align_length) * 100 if align_length > 0 else 0
+    
+    # Handle empty alignments
+    if covered_positions == 0:
+        return depth_array, {
+            'coverage_percent': 0.0,
+            'min_coverage': 0.0,
+            'max_coverage': 0.0,
+            'avg_coverage': 0.0,
+            'median_coverage': 0.0
+        }
+    
+    # Only consider positions that have coverage
+    non_zero_depths = depth_array[depth_array > 0]
+    
+    coverage_stats = {
+        'coverage_percent': coverage_percent,
+        'min_coverage': np.min(non_zero_depths),
+        'max_coverage': np.max(depth_array),
+        'avg_coverage': np.mean(non_zero_depths),
+        'median_coverage': np.median(non_zero_depths)
+    }
+    
+    return depth_array, coverage_stats
 
+def calculate_sequence_coverage(record: SeqRecord, alignment_length: int) -> Dict[str, float]:
+    """
+    Calculate coverage metrics for an individual sequence.
+    """
+    sequence = str(record.seq).upper()
+    
+    # Count non-gap positions
+    non_gap_count = sum(1 for char in sequence if char != '-')
+    
+    # Calculate coverage percentage
+    coverage_percent = (non_gap_count / alignment_length) * 100 if alignment_length > 0 else 0
+    
+    return {
+        'sequence_coverage_percent': coverage_percent,
+        'sequence_length_no_gaps': non_gap_count
+    }
 
 
 # =============================================================================
@@ -642,8 +727,11 @@ def filter_reference_outliers(records: List[SeqRecord],
 def parallel_sequence_analysis(records: List[SeqRecord], 
                              consensus_seq: Optional[str],
                              frequencies: Optional[List[Dict[str, float]]],
+                             alignment_length: Optional[int] = None,
                              chunk_size: int = 100) -> Dict[str, Dict[str, float]]:
-    """Parallel version of sequence metric calculation."""
+    """
+    Parallel version of sequence metric calculation.
+    """
     def process_chunk(chunk):
         return {record.id: analyse_sequence_metrics(record, consensus_seq, frequencies) 
                 for record in chunk}
@@ -749,6 +837,8 @@ def write_metrics_report(filter_result: FilterResult, output_path: str) -> None:
             'length',
             'at_content',
             'human_similarity',
+            'sequence_coverage_percent',
+            'sequence_length_no_gaps',
             'consensus_at',
             'at_difference',
             'unweighted_deviation',
@@ -866,7 +956,32 @@ def write_ordered_annotated_alignment(kept_records: List[SeqRecord],
     # Write to file
     write_sequences_to_fasta(sorted_records, output_path)
 
-
+def concatenate_consensus_sequences(consensus_dir: str, output_file: str) -> None:
+    """
+    Concatenate all consensus sequences from the consensus directory into a single FASTA file.
+    
+    Args:
+        consensus_dir: Directory containing individual consensus FASTA files
+        output_file: Path to output concatenated FASTA file
+    """
+    consensus_files = [
+        f for f in os.listdir(consensus_dir)
+        if f.lower().endswith(('_consensus.fasta', '_consensus.fas', '_consensus.fa'))
+    ]
+    
+    if not consensus_files:
+        print("No consensus sequences found to concatenate")
+        return
+    
+    # Sort files to ensure consistent order
+    consensus_files.sort()
+    
+    with open(output_file, 'w') as outfile:
+        for filename in consensus_files:
+            filepath = os.path.join(consensus_dir, filename)
+            with open(filepath) as infile:
+                for line in infile:
+                    outfile.write(line)
 
 
 # =============================================================================
@@ -926,6 +1041,9 @@ def apply_filters(alignment: MultipleSeqAlignment,
         'reference_outlier': []
     }
     
+    # Get alignment length for coverage calculations
+    alignment_length = alignment.get_alignment_length()
+    
     # We'll track metrics for ALL sequences, including removed ones
     metrics = {}
     
@@ -943,8 +1061,8 @@ def apply_filters(alignment: MultipleSeqAlignment,
     # Calculate initial metrics for all sequences
     for record in current_records:
         metrics[record.id] = analyse_sequence_metrics(
-            record, initial_consensus_seq, initial_frequencies
-    )
+            record, initial_consensus_seq, initial_frequencies, alignment_length
+        )
     
     # 1. Human COX1 similarity filtering
     if enable_human and current_records:
@@ -957,7 +1075,7 @@ def apply_filters(alignment: MultipleSeqAlignment,
         # Update metrics for remaining sequences
         for record in current_records:
             metrics[record.id].update(
-                analyse_sequence_metrics(record, consensus_seq, frequencies)
+                analyse_sequence_metrics(record, consensus_seq, frequencies, alignment_length)
             )
     
     # 2. AT content filtering with mode support
@@ -975,7 +1093,7 @@ def apply_filters(alignment: MultipleSeqAlignment,
             consensus_seq, frequencies = update_consensus(current_records)
             for record in current_records:
                 metrics[record.id].update(
-                    analyse_sequence_metrics(record, consensus_seq, frequencies)
+                    analyse_sequence_metrics(record, consensus_seq, frequencies, alignment_length)
                 )
     
     # 3. Statistical outlier filtering
@@ -990,7 +1108,7 @@ def apply_filters(alignment: MultipleSeqAlignment,
             consensus_seq, frequencies = update_consensus(current_records)
             for record in current_records:
                 metrics[record.id].update(
-                    analyse_sequence_metrics(record, consensus_seq, frequencies)
+                    analyse_sequence_metrics(record, consensus_seq, frequencies, alignment_length)
                 )
     
     # 4. Reference sequence filtering (if provided)
@@ -1106,7 +1224,16 @@ def process_fasta_file(input_file: str,
             alignment = AlignIO.read(input_file, "fasta")
             stats['input_sequences'] = len(alignment)
             log_message(f"Input sequences: {stats['input_sequences']}\n", log_file)
-            
+
+            # Calculate coverage metrics for the entire alignment
+            coverage_depth, coverage_stats = calculate_coverage_depth(alignment)
+            log_message("\nCoverage Statistics:", log_file)
+            log_message(f"- Coverage percentage: {coverage_stats['coverage_percent']:.2f}%", log_file)
+            log_message(f"- Minimum coverage depth: {coverage_stats['min_coverage']}", log_file)
+            log_message(f"- Maximum coverage depth: {coverage_stats['max_coverage']}", log_file)
+            log_message(f"- Average coverage depth: {coverage_stats['avg_coverage']:.2f}", log_file)
+            log_message(f"- Median coverage depth: {coverage_stats['median_coverage']:.2f}\n", log_file)
+
             # Apply filters
             log_message(separator, log_file)
             log_message("Filtering Progress:", log_file)
@@ -1311,12 +1438,19 @@ def parallel_process_directory(args: argparse.Namespace) -> None:
             print(f"- {filename}")
     print("=" * 80)
     
+    print("\nConcatenating consensus sequences...")
+    concatenated_consensus_file = os.path.join(args.output_dir, 'all_consensus_sequences.fasta')
+    concatenate_consensus_sequences(
+        output_subdirs['consensus_seqs'],
+        concatenated_consensus_file
+    )
+    print(f"Concatenated consensus sequences written to: {concatenated_consensus_file}")
+    
     # Write the summary file
     total_stats = defaultdict(int)
     total_stats['processed_files'] = completed_files
     total_stats['error_files'] = len(error_files)
     write_summary(total_stats, output_subdirs['logs'])
-
 
 
 
