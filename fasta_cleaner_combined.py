@@ -3,6 +3,7 @@
 # =============================================================================
 import os
 import sys
+import re
 import csv
 import argparse
 from datetime import datetime
@@ -102,15 +103,12 @@ Progress Tracking:
 ----------------
 - Real-time progress bar with percentage completion
 - Estimated time remaining (ETA)
-- Error reporting for failed files
+- Error reporting for failed files (graceful handling of empty alignments)
 - Final summary with total processing time and error count
 
-Error Handling:
--------------
-- Graceful handling of empty alignments
-- Proper handling of no-variation cases in outlier detection
-- Detailed error logging with tracebacks
-- Keyboard interrupt handling for clean shutdown
+Authors: B. Price & D. Parsons @ NHMUK
+Version: 1.0.2
+Licence: MIT
 """
 
 
@@ -718,7 +716,23 @@ def filter_reference_outliers(records: List[SeqRecord],
     
     return kept, removed, aggregate_metrics
 
-
+def count_ambiguous_bases(consensus_sequence: str) -> int:
+    """
+    Count the number of ambiguous bases (not G, T, A, or C) in a consensus sequence.
+    
+    Args:
+        consensus_sequence: Consensus sequence string
+    
+    Returns:
+        Number of ambiguous bases
+    """
+    # Convert to uppercase and remove gaps
+    sequence = consensus_sequence.upper().replace('-', '')
+    
+    # Count non-GTAC bases
+    non_standard_bases = sum(1 for base in sequence if base not in 'GTAC')
+    
+    return non_standard_bases
 
 
 # =============================================================================
@@ -983,6 +997,161 @@ def concatenate_consensus_sequences(consensus_dir: str, output_file: str) -> Non
                 for line in infile:
                     outfile.write(line)
 
+def extract_log_statistics(log_file_path: str) -> Dict[str, Any]:
+    """
+    Extract statistics from a sample log file.
+    
+    Args:
+        log_file_path: Path to the log file
+    
+    Returns:
+        Dictionary containing extracted statistics
+    """
+    stats = {
+        'sample_name': '',
+        'input_reads': 0,
+        'removed_human': 0,
+        'removed_at_distance': 0,
+        'removed_outliers': 0,
+        'cleaned_reads': 0,
+        'cov_percent': 0.0,
+        'cov_mean': 0.0,
+        'cov_max': 0,
+        'cov_min': 0
+    }
+    
+    try:
+        with open(log_file_path, 'r') as f:
+            log_content = f.read()
+            
+            # Extract sample name from "Processing Sample:" line
+            sample_match = re.search(r"Processing Sample: (.+)$", log_content, re.MULTILINE)
+            if sample_match:
+                stats['sample_name'] = sample_match.group(1)
+            
+            # Extract input sequences
+            input_match = re.search(r"Input sequences: (\d+)", log_content)
+            if input_match:
+                stats['input_reads'] = int(input_match.group(1))
+            
+            # Extract removed sequences by category
+            human_match = re.search(r"Removed \(human_similar\): (\d+)", log_content)
+            if human_match:
+                stats['removed_human'] = int(human_match.group(1))
+                
+            at_match = re.search(r"Removed \(at_difference\): (\d+)", log_content)
+            if at_match:
+                stats['removed_at_distance'] = int(at_match.group(1))
+                
+            outlier_match = re.search(r"Removed \(statistical_outlier\): (\d+)", log_content)
+            if outlier_match:
+                stats['removed_outliers'] = int(outlier_match.group(1))
+            
+            # Extract kept sequences
+            kept_match = re.search(r"Kept sequences: (\d+)", log_content)
+            if kept_match:
+                stats['cleaned_reads'] = int(kept_match.group(1))
+            
+            # Extract coverage statistics
+            cov_percent_match = re.search(r"Coverage percentage: ([\d.]+)%", log_content)
+            if cov_percent_match:
+                stats['cov_percent'] = float(cov_percent_match.group(1))
+                
+            cov_min_match = re.search(r"Minimum coverage depth: (\d+)", log_content)
+            if cov_min_match:
+                stats['cov_min'] = int(cov_min_match.group(1))
+                
+            cov_max_match = re.search(r"Maximum coverage depth: (\d+)", log_content)
+            if cov_max_match:
+                stats['cov_max'] = int(cov_max_match.group(1))
+                
+            cov_avg_match = re.search(r"Average coverage depth: ([\d.]+)", log_content)
+            if cov_avg_match:
+                stats['cov_mean'] = float(cov_avg_match.group(1))
+    
+    except Exception as e:
+        print(f"Error extracting statistics from {log_file_path}: {str(e)}")
+    
+    return stats
+
+def generate_combined_statistics(output_dir: str) -> None:
+    """
+    Generate a combined statistics CSV file for all processed samples.
+    
+    Args:
+        output_dir: Output directory containing logs and consensus sequences
+    """
+    import os
+    import csv
+    import re
+    from Bio import SeqIO
+    
+    # Define paths
+    logs_dir = os.path.join(output_dir, 'logs')
+    consensus_dir = os.path.join(output_dir, 'consensus_seqs')
+    output_file = os.path.join(output_dir, 'combined_statistics.csv')
+    
+    # Check if directories exist
+    if not os.path.exists(logs_dir) or not os.path.exists(consensus_dir):
+        print(f"Required directories not found in {output_dir}")
+        return
+    
+    # Get list of log files
+    log_files = [f for f in os.listdir(logs_dir) if f.endswith('_log.txt')]
+    
+    # Initialize results list
+    all_stats = []
+    
+    # Process each log file
+    for log_file in log_files:
+        log_path = os.path.join(logs_dir, log_file)
+        
+        # Extract statistics from log file
+        stats = extract_log_statistics(log_path)
+        
+        # Get sample name from log statistics
+        sample_name = stats['sample_name']
+        
+        # Find corresponding consensus file
+        consensus_file = f"{sample_name}_consensus.fasta"
+        consensus_path = os.path.join(consensus_dir, consensus_file)
+        
+        # Count ambiguous bases in consensus sequence if file exists
+        ambig_bases = 0
+        if os.path.exists(consensus_path):
+            try:
+                # Read consensus sequence
+                consensus_records = list(SeqIO.parse(consensus_path, "fasta"))
+                if consensus_records:
+                    consensus_seq = str(consensus_records[0].seq)
+                    ambig_bases = count_ambiguous_bases(consensus_seq)
+            except Exception as e:
+                print(f"Error counting ambiguous bases in {consensus_path}: {str(e)}")
+        
+        # Add ambiguous bases count to statistics
+        stats['final_ambig_bases'] = ambig_bases
+        
+        # Add to results list
+        all_stats.append(stats)
+    
+    # Write results to CSV file
+    if all_stats:
+        with open(output_file, 'w', newline='') as csvfile:
+            fieldnames = [
+                'sample_name', 'input_reads', 'removed_human', 'removed_at_distance',
+                'removed_outliers', 'cleaned_reads', 'final_ambig_bases',
+                'cov_percent', 'cov_mean', 'cov_max', 'cov_min'
+            ]
+            
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for stats in all_stats:
+                writer.writerow(stats)
+        
+        print(f"Combined statistics written to: {output_file}")
+    else:
+        print("No statistics to write")
 
 # =============================================================================
 # Main Process Control Functions
@@ -1317,6 +1486,10 @@ def process_fasta_file(input_file: str,
     
     return stats
 
+# Add import re at the top of your imports section:
+import re
+
+# Add these imports to your existing functions:
 def parallel_process_directory(args: argparse.Namespace) -> None:
     """Process multiple FASTA files in parallel with progress tracking."""
     import sys
@@ -1451,7 +1624,10 @@ def parallel_process_directory(args: argparse.Namespace) -> None:
     total_stats['processed_files'] = completed_files
     total_stats['error_files'] = len(error_files)
     write_summary(total_stats, output_subdirs['logs'])
-
+    
+    # Generate combined statistics CSV file
+    print("\nGenerating combined statistics CSV file...")
+    generate_combined_statistics(args.output_dir)
 
 
 # =============================================================================
